@@ -1,0 +1,4 @@
+monosynth
+*.o
+crash.log
+.DS_Store
