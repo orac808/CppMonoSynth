@@ -30,6 +30,7 @@ static constexpr float  ATTACK_MS           = 5.0f;
 static constexpr int    NUM_WAVEFORMS       = 4;
 static constexpr int    OLED_INTERVAL       = 2205;  // ~50ms at 44100Hz
 static constexpr float  PARAM_SMOOTH_COEFF = 0.002f;
+static constexpr float  MASTER_GAIN        = 0.35f;   // match Pd patch output level
 
 static const char* WAVE_NAMES[] = {"Saw", "PWM", "Tri", "Sine"};
 static const int   LED_COLORS[] = {1, 2, 3, 4};  // Red, Yellow, Green, Cyan
@@ -625,7 +626,7 @@ int main() {
             float absS = fabsf(s);
             if (absS > peakLevel) peakLevel = absS;
 
-            int16_t sample = (int16_t)(s * 32767.0f);
+            int16_t sample = (int16_t)(s * 32767.0f * MASTER_GAIN);
             buf[i * 2]     = sample;  // L
             buf[i * 2 + 1] = sample;  // R
         }
