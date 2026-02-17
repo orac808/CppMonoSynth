@@ -29,9 +29,10 @@ static constexpr float  INV_SR              = 1.0f / SAMPLE_RATE;
 static constexpr float  ATTACK_MS           = 5.0f;
 static constexpr int    NUM_WAVEFORMS       = 4;
 static constexpr int    OLED_INTERVAL       = 2205;  // ~50ms at 44100Hz
-static constexpr float  CUTOFF_SMOOTH_COEFF = 0.002f;
+static constexpr float  PARAM_SMOOTH_COEFF = 0.002f;
 
 static const char* WAVE_NAMES[] = {"Saw", "PWM", "Tri", "Sine"};
+static const int   LED_COLORS[] = {1, 2, 3, 4};  // Red, Yellow, Green, Cyan
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -124,6 +125,24 @@ struct Portamento {
     float tick() {
         current += coeff * (target - current);
         return exp2f(current);
+    }
+};
+
+// ─── Triangle LFO (for PWM modulation, tied to portamento time) ─────────────
+
+struct TriLFO {
+    float phase = 0.0f;
+    float freq  = 0.0f;
+
+    void setPeriodMs(float ms) {
+        freq = (ms < 1.0f) ? 0.0f : 1000.0f / ms;
+    }
+
+    float tick() {
+        if (freq <= 0.0f) return 0.0f;
+        phase += freq * INV_SR;
+        if (phase >= 1.0f) phase -= 1.0f;
+        return (phase < 0.5f) ? (4.0f * phase - 1.0f) : (3.0f - 4.0f * phase);
     }
 };
 
@@ -358,6 +377,24 @@ static void osc_send_5i(int sock, struct sockaddr_in* addr,
            (struct sockaddr*)addr, sizeof(*addr));
 }
 
+// ─── OSC helper: send 1 int (for /led) ──────────────────────────────────────
+
+static void osc_send_1i(int sock, struct sockaddr_in* addr,
+                         const char* path, int v0) {
+    uint8_t buf[64];
+    int plen = osc_pad((int)strlen(path) + 1);
+    int total = plen + 4 + 4;  // path + ",i\0\0" + int
+    if (total > (int)sizeof(buf)) return;
+    memset(buf, 0, total);
+    memcpy(buf, path, strlen(path));
+    int off = plen;
+    buf[off++] = ','; buf[off++] = 'i'; buf[off++] = 0; buf[off++] = 0;
+    uint32_t nv = htonl((uint32_t)v0);
+    memcpy(buf + off, &nv, 4);
+    sendto(sock, buf, total, 0,
+           (struct sockaddr*)addr, sizeof(*addr));
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -456,17 +493,18 @@ int main() {
     }
     snd_pcm_prepare(pcm);
     osc_send_str(mother_sock, &mother_addr, "/oled/line/2", "Audio ready");
+    osc_send_1i(mother_sock, &mother_addr, "/led", LED_COLORS[0]);
 
     // ── Voice + params ──
     Voice voice;
-    float masterVol    = 0.5f;
+    TriLFO pwmLfo;
+    float volTarget    = 0.5f;
+    float volSmooth    = 0.5f;
     float cutoffTarget = 8000.0f;
     float cutoffSmooth = 8000.0f;
     float resoTarget   = 0.0f;
     float resoSmooth   = 0.0f;
-    float pwTarget     = 0.5f;
-    float pwSmooth     = 0.5f;
-    int   oledCounter  = 0;
+    int   oledCounter  = OLED_INTERVAL;  // trigger immediate OLED draw
     float peakLevel    = 0.0f;
 
     // Display values for OLED formatting
@@ -475,11 +513,12 @@ int main() {
     float dispReso      = 0.0f;
     float dispReleaseMs = 200.0f;
 
-    // Previous OLED strings for dirty checking
+    // Previous OLED strings / VU for dirty checking
     char prevLine1[32] = "";
     char prevLine2[32] = "";
     char prevLine3[32] = "";
     char prevLine4[32] = "";
+    int  prevVuWidth    = -1;
     char prevLine5[32] = "";
 
     voice.filt.setParams(cutoffTarget, resoTarget);
@@ -509,25 +548,31 @@ int main() {
                 // /key <index:i> <vel:i>
                 int32_t index = osc_int(osc_buf + args_off);
                 int32_t vel   = osc_int(osc_buf + args_off + 4);
-                int note = index + 59;
-                if (vel > 0) {
-                    voice.noteOn(note);
-                } else {
-                    voice.noteOff(note);
+                if (index > 0 && index < 25) {  // keys 1-24
+                    int note = index + 59;
+                    if (vel > 0) {
+                        voice.noteOn(note);
+                    } else {
+                        voice.noteOff(note);
+                    }
+                } else if (index == 0 && vel > 0) {  // AUX button
+                    voice.targetWaveform = (voice.targetWaveform + 1) % NUM_WAVEFORMS;
+                    osc_send_1i(mother_sock, &mother_addr, "/led",
+                                LED_COLORS[voice.targetWaveform]);
                 }
             }
-            else if (strcmp(addr, "/knobs") == 0 && n >= args_off + 24) {
-                // /knobs <k1> <k2> <k3> <k4> <k5> <k6>
+            else if (strcmp(addr, "/knobs") == 0 && n >= args_off + 20) {
+                // /knobs <k1> <k2> <k3> <k4> <k5> (K6 ignored if present)
                 int32_t k1 = osc_int(osc_buf + args_off);
                 int32_t k2 = osc_int(osc_buf + args_off + 4);
                 int32_t k3 = osc_int(osc_buf + args_off + 8);
                 int32_t k4 = osc_int(osc_buf + args_off + 12);
                 int32_t k5 = osc_int(osc_buf + args_off + 16);
-                int32_t k6 = osc_int(osc_buf + args_off + 20);
 
-                // K1: Portamento 0–500ms linear
+                // K1: Portamento 0–500ms linear (also sets PWM LFO rate)
                 float portoMs = k1 * (500.0f / 1023.0f);
                 voice.porta.setTime(portoMs);
+                pwmLfo.setPeriodMs(portoMs);
                 dispPortoMs = portoMs;
 
                 // K2: Filter cutoff 20–18kHz exponential (target only, smoothed in audio loop)
@@ -544,15 +589,17 @@ int main() {
                 dispReleaseMs = releaseMs;
 
                 // K5: Master volume 0–1
-                masterVol = k5 / 1023.0f;
+                volTarget = k5 / 1023.0f;
 
-                // K6: Pulse width 5%–95%
-                pwTarget = 0.05f + k6 * (0.9f / 1023.0f);
+                // OLED updates on regular 50ms cycle (no forced redraw)
             }
             else if (strcmp(addr, "/aux") == 0 && n >= args_off + 4) {
                 int32_t auxVal = osc_int(osc_buf + args_off);
-                if (auxVal > 0)
-                    voice.targetWaveform++;  // always increment for forward morph
+                if (auxVal > 0) {
+                    voice.targetWaveform = (voice.targetWaveform + 1) % NUM_WAVEFORMS;
+                    osc_send_1i(mother_sock, &mother_addr, "/led",
+                                LED_COLORS[voice.targetWaveform]);
+                }
             }
             else if (strcmp(addr, "/quit") == 0) {
                 g_running = 0;
@@ -562,14 +609,14 @@ int main() {
         // Fill audio buffer
         for (int i = 0; i < PERIOD_FRAMES; i++) {
             // Smooth control parameters (one-pole)
-            cutoffSmooth += CUTOFF_SMOOTH_COEFF * (cutoffTarget - cutoffSmooth);
-            resoSmooth   += CUTOFF_SMOOTH_COEFF * (resoTarget - resoSmooth);
-            pwSmooth     += CUTOFF_SMOOTH_COEFF * (pwTarget - pwSmooth);
+            cutoffSmooth += PARAM_SMOOTH_COEFF * (cutoffTarget - cutoffSmooth);
+            resoSmooth   += PARAM_SMOOTH_COEFF * (resoTarget - resoSmooth);
+            volSmooth    += PARAM_SMOOTH_COEFF * (volTarget - volSmooth);
 
-            voice.osc.pulseWidth = pwSmooth;
+            voice.osc.pulseWidth = 0.5f + 0.4f * pwmLfo.tick();
             voice.filt.setParams(cutoffSmooth, resoSmooth);
 
-            float s = voice.tick() * masterVol;
+            float s = voice.tick() * volSmooth;
             // Soft clip
             if (s > 1.0f) s = 1.0f;
             else if (s < -1.0f) s = -1.0f;
@@ -654,11 +701,12 @@ int main() {
             // VU bar: graphical filled rectangle at bottom of OLED (128x64)
             int vuWidth = (int)(peakLevel * 122.0f);
             if (vuWidth > 122) vuWidth = 122;
-            // Clear VU area
-            osc_send_5i(mother_sock, &mother_addr, "/oled/gBox", 3, 55, 125, 62, 0);
-            // Draw filled bar
-            if (vuWidth > 0)
-                osc_send_5i(mother_sock, &mother_addr, "/oled/gBox", 3, 55, 3 + vuWidth, 62, 1);
+            if (vuWidth != prevVuWidth) {
+                osc_send_5i(mother_sock, &mother_addr, "/oled/gBox", 3, 55, 125, 62, 0);
+                if (vuWidth > 0)
+                    osc_send_5i(mother_sock, &mother_addr, "/oled/gBox", 3, 55, 3 + vuWidth, 62, 1);
+                prevVuWidth = vuWidth;
+            }
 
             // Peak decay
             peakLevel *= 0.95f;

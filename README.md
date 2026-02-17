@@ -6,25 +6,24 @@ A monophonic synthesizer for the [Critter & Guitari Organelle](https://www.critt
 
 - **4 waveforms** — Saw, Pulse (PWM), Triangle, Sine with PolyBLEP anti-aliasing
 - **Waveform morphing** — smooth crossfade between adjacent waveforms via AUX button
+- **LED color per waveform** — Saw=Red, Pulse=Yellow, Tri=Green, Sine=Cyan
 - **Cytomic SVF filter** — trapezoidal-integration low-pass, unconditionally stable at all cutoff/resonance settings
 - **Portamento** — one-pole glide in log2-frequency domain with legato note priority
+- **PWM LFO** — triangle LFO modulates pulse width, rate tied to portamento time (K1)
 - **AR envelope** — fast attack, knob-controlled release (10ms–2s)
-- **Pulse width control** — 5%–95% via knob
-- **OLED UI** — real-time parameter display + VU meter bar
+- **OLED UI** — real-time parameter display + VU meter bar, rate-limited to ~20 fps with dirty checking
 - **Last-note-priority** note stack with legato behavior
 
 ## Controls
 
 | Knob | Parameter | Range |
 |------|-----------|-------|
-| K1 | Portamento | 0–500 ms |
+| K1 | Portamento + PWM LFO rate | 0–500 ms (0 = no glide, static PW) |
 | K2 | Filter cutoff | 20 Hz – 18 kHz (exponential) |
 | K3 | Filter resonance | 0–0.95 |
 | K4 | Amp release | 10 ms – 2 s (exponential) |
-| K5 | Master volume | 0–1 |
-| K6 | Pulse width | 5%–95% |
-| AUX | Cycle waveform | Saw → Pulse → Tri → Sine (morphs) |
-| Keys | Play notes | Organelle keys mapped to MIDI 60+ |
+| AUX | Cycle waveform | Saw → Pulse → Tri → Sine (morphs), LED changes color |
+| Keys | Play notes | Organelle 1 keys (indices 1–24, MIDI 60–83) |
 
 ## Building
 
@@ -139,9 +138,9 @@ Messages received on port 4000:
 
 | Address | Args | Description |
 |---------|------|-------------|
-| `/key` | `ii` (index, velocity) | Key press/release. Index 0 = leftmost key, maps to MIDI note `index + 59`. Velocity 0 = note off. |
-| `/knobs` | `iiiiii` (K1–K6) | All 6 knob values, range 0–1023 each. Sent on any knob change. |
-| `/aux` | `i` (state) | AUX button. Value > 0 = pressed. |
+| `/key` | `ii` (index, velocity) | Key press/release. **Index 0 = AUX button**, indices 1–24 = piano keys. Piano keys map to MIDI note `index + 59` (key 1 = middle C). Velocity 0 = note off. |
+| `/knobs` | `iiiiii` (K1–K6) | All 6 knob values, range 0–1023 each. Sent on any knob change (~100 Hz when turning). |
+| `/aux` | `i` (state) | AUX button. Value > 0 = pressed. **Unreliable** — mother may not send this; always handle AUX via `/key` index 0 instead. |
 | `/quit` | (none) | Organelle is shutting down the patch. Set `g_running = 0`. |
 
 Messages sent to port 4001:
@@ -150,17 +149,56 @@ Messages sent to port 4001:
 |---------|------|-------------|
 | `/oled/line/N` | `s` (text) | Set text on OLED line N (1–5). Max ~21 characters. |
 | `/oled/gBox` | `iiiii` (x1, y1, x2, y2, fill) | Draw filled/unfilled rectangle. OLED is 128x64 pixels. fill=1 for white, 0 for black. |
+| `/led` | `i` (color) | Set the LED color. Values: 0=off, 1=red, 2=yellow, 3=green, 4=cyan, 5=blue, 6=purple, 7=white. |
 
 The OSC socket should be **non-blocking** (`O_NONBLOCK`) so the audio loop never stalls waiting for messages. Use `SO_REUSEADDR` and retry `bind()` with delays in case the port is in `TIME_WAIT` from a previous patch.
+
+### AUX Button
+
+**The AUX button sends `/key` with index 0** — the same message format as piano keys. The mother _may_ also send a separate `/aux` message, but this is unreliable across firmware versions. Always handle AUX in your `/key` handler:
+
+```cpp
+if (index > 0 && index < 25) {
+    // Piano keys (1–24)
+    handleNote(index + 59, vel);
+} else if (index == 0 && vel > 0) {
+    // AUX button pressed
+    handleAux();
+}
+```
+
+Do NOT rely on the `/aux` OSC address as your primary handler. You can keep it as a fallback, but `/key 0` is the reliable path.
+
+### LED
+
+Control the Organelle's LED color by sending `/led` with an int to port 4001:
+
+```cpp
+osc_send_1i(mother_sock, &mother_addr, "/led", color);
+```
+
+| Value | Color |
+|-------|-------|
+| 0 | Off |
+| 1 | Red |
+| 2 | Yellow |
+| 3 | Green |
+| 4 | Cyan |
+| 5 | Blue |
+| 6 | Purple |
+| 7 | White |
+
+The LED persists until changed — no need to re-send. Useful for indicating mode (e.g., one color per waveform).
 
 ### OLED Display
 
 The Organelle has a 128x64 monochrome OLED. The mother process provides 5 text lines and graphics primitives via OSC.
 
 Best practices:
-- **Rate-limit updates to ~50ms** (every ~2205 samples at 44100 Hz). Faster updates are silently dropped or cause flicker.
-- **Dirty-check** each line before sending — only send when the string changes.
-- **VU meter**: use `/oled/gBox` to draw a filled bar. Clear the area first (fill=0), then draw the bar (fill=1).
+- **Rate-limit updates to ~50ms** (every ~2205 samples at 44100 Hz). Faster updates flood the mother process and cause lag.
+- **Never force OLED redraws from the knobs handler.** Knob messages arrive at ~100 Hz. If you reset your OLED timer on every knob message, you'll send ~700 OSC packets/sec during knob turns, overwhelming the mother. Let the regular 50ms cycle handle all screen updates.
+- **Dirty-check everything** before sending — text lines AND graphical elements (e.g., VU bar width). Only send when a value actually changes.
+- **VU meter**: use `/oled/gBox` to draw a filled bar. Clear the area first (fill=0), then draw the bar (fill=1). Track the previous width and skip sends when unchanged.
 - The OLED auto-clears on patch launch — no need to send blank lines at startup.
 
 ### run.sh Patterns
@@ -215,11 +253,18 @@ osc_send_str(mother_sock, &mother_addr, "/oled/line/2", "Init...");
 
 **Retry with delays** — both `bind()` and `snd_pcm_open()` can fail transiently. Retry up to 10 times with 500ms delays. Display the attempt count on OLED so you can see it's not frozen.
 
-**Smooth control parameters** — knob values from OSC arrive at irregular intervals. Apply one-pole smoothing in the audio loop to avoid clicks:
+**Smooth ALL signal-path parameters** — knob values from OSC arrive at irregular intervals (~100 Hz). Any parameter that directly multiplies or shapes the audio signal (volume, cutoff, resonance) will produce audible zipper noise if applied as raw step changes. Apply one-pole smoothing per sample in the audio loop:
 
 ```cpp
-cutoffSmooth += 0.002f * (cutoffTarget - cutoffSmooth);
+static constexpr float PARAM_SMOOTH_COEFF = 0.002f;
+
+// In audio loop (per sample):
+cutoffSmooth += PARAM_SMOOTH_COEFF * (cutoffTarget - cutoffSmooth);
+resoSmooth   += PARAM_SMOOTH_COEFF * (resoTarget - resoSmooth);
+volSmooth    += PARAM_SMOOTH_COEFF * (volTarget - volSmooth);
 ```
+
+Parameters that set time constants (portamento rate, envelope release) don't need audio-rate smoothing — they control the speed of change, not the signal amplitude directly.
 
 **Soft clip the output** — prevents harsh digital distortion if the synth output exceeds ±1.0:
 
