@@ -4,25 +4,31 @@ A monophonic synthesizer for the [Critter & Guitari Organelle](https://www.critt
 
 ## Features
 
-- **4 waveforms** — Saw, Pulse (PWM), Triangle, Sine with PolyBLEP anti-aliasing
+- **4 waveforms** — Saw, Pulse (PWM), Triangle, Ratio PWM with PolyBLEP anti-aliasing
+- **Ratio PWM mode** — pulse wave with note-frequency-tracked PWM modulation; K1 sweeps the ratio continuously from 1/16x to 8x for sub-bass throb to harmonic shimmer
 - **Waveform morphing** — smooth crossfade between adjacent waveforms via AUX button
-- **LED color per waveform** — Saw=Red, Pulse=Yellow, Tri=Green, Sine=Cyan
+- **LED color per waveform** — Saw=Red, Pulse=Yellow, Tri=Green, RatioPWM=Cyan
+- **Play-style-reactive effects** — distortion and reverb respond to how you play:
+  - **Distortion** — tanh waveshaper with pre-gain boost, up to 16x drive. Fast staccato playing increases grit automatically
+  - **Reverb** — Schroeder stereo reverb with LP-combs (40–50ms delays, feedback 0.86–0.92), dark LP filtering, and 85% wet cap. Sustained playing opens up longer, more spacious tails
 - **Cytomic SVF filter** — trapezoidal-integration low-pass, unconditionally stable at all cutoff/resonance settings
 - **Portamento** — one-pole glide in log2-frequency domain with legato note priority
-- **PWM LFO** — triangle LFO modulates pulse width, rate tied to portamento time (K1)
+- **PWM LFO** — triangle LFO modulates pulse width, rate tied to portamento time (K1) (modes 0–2)
 - **AR envelope** — fast attack, knob-controlled release (10ms–2s)
-- **OLED UI** — real-time parameter display + VU meter bar, rate-limited to ~20 fps with dirty checking
+- **Stereo output** — reverb produces independent L/R channels with offset comb/allpass delays for width
+- **OLED UI** — real-time parameter display + VU meter bar, rate-limited to ~20 fps with dirty checking. Shows distortion/reverb amounts and context-sensitive K1 display
 - **Last-note-priority** note stack with legato behavior
 
 ## Controls
 
 | Knob | Parameter | Range |
 |------|-----------|-------|
-| K1 | Portamento + PWM LFO rate | 0–500 ms (0 = no glide, static PW) |
+| K1 | Portamento + PWM LFO rate (modes 0–2) | 0–500 ms (0 = no glide, static PW) |
+| K1 | PWM ratio (mode 3 / Ratio PWM) | 1/16x – 8x continuous (exponential) |
 | K2 | Filter cutoff | 20 Hz – 18 kHz (exponential) |
 | K3 | Filter resonance | 0–0.95 |
 | K4 | Amp release | 10 ms – 2 s (exponential) |
-| AUX | Cycle waveform | Saw → Pulse → Tri → Sine (morphs), LED changes color |
+| AUX | Cycle waveform | Saw → Pulse → Tri → RatioPWM (morphs), LED changes color |
 | Keys | Play notes | Organelle 1 keys (indices 1–24, MIDI 60–83) |
 
 ## Building
@@ -123,7 +129,7 @@ Typical hw_params:
 - Rate: 44100 Hz
 - Period: 128 frames (~2.9 ms latency)
 - Buffer: 512 frames (4 periods)
-- Channels: 2 (stereo, both channels get the same mono signal)
+- Channels: 2 (stereo — independent L/R from reverb)
 
 ### OSC Protocol
 
