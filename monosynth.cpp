@@ -32,7 +32,6 @@ static constexpr int    OLED_INTERVAL       = 2205;  // ~50ms at 44100Hz
 static constexpr float  PARAM_SMOOTH_COEFF = 0.002f;
 static constexpr float  MASTER_GAIN        = 0.35f;   // match Pd patch output level
 
-static const char* WAVE_NAMES[] = {"Saw", "PWM", "Tri", "Sine"};
 static const int   LED_COLORS[] = {1, 2, 3, 4};  // Red, Yellow, Green, Cyan
 
 static volatile sig_atomic_t g_running = 1;
@@ -59,10 +58,14 @@ struct Oscillator {
     float phase = 0.0f;
     float freq  = 440.0f;
     float pulseWidth = 0.5f;
+    float pwmPhase = 0.0f;
+    float pwmRatio = 1.0f;
 
     void advance() {
         phase += freq * INV_SR;
         if (phase >= 1.0f) phase -= 1.0f;
+        pwmPhase += freq * pwmRatio * INV_SR;
+        if (pwmPhase >= 1.0f) pwmPhase -= floorf(pwmPhase);
     }
 
     float saw() const {
@@ -86,8 +89,15 @@ struct Oscillator {
         return (phase < 0.5f) ? (4.0f * phase - 1.0f) : (3.0f - 4.0f * phase);
     }
 
-    float sine() const {
-        return sinf(TWO_PI * phase);
+    float ratioPulse() const {
+        float pw = 0.5f + 0.4f * sinf(TWO_PI * pwmPhase);
+        float dt = freq * INV_SR;
+        float s = (phase < pw) ? 1.0f : -1.0f;
+        s += polyblep(phase, dt);
+        float shifted = phase - pw;
+        if (shifted < 0.0f) shifted += 1.0f;
+        s -= polyblep(shifted, dt);
+        return s;
     }
 
     float waveform(int idx) const {
@@ -95,7 +105,7 @@ struct Oscillator {
         case 0: return saw();
         case 1: return pulse();
         case 2: return triangle();
-        case 3: return sine();
+        case 3: return ratioPulse();
         default: return saw();
         }
     }
@@ -254,6 +264,198 @@ struct NoteStack {
 
     int top() const { return size > 0 ? notes[size - 1] : -1; }
     bool empty() const { return size == 0; }
+};
+
+// ─── Note Tracker (speed/length dynamics from play style) ───────────────────
+
+struct NoteTracker {
+    uint64_t sampleCounter    = 0;
+    uint64_t lastNoteOnSample = 0;
+    float    avgIntervalSamples = 44100.0f;  // 1 second default
+    float    speed            = 0.0f;        // 0=slow, 1=fast
+    float    length           = 0.0f;        // 0=short, 1=long
+
+    // Ring buffer of last 3 note durations
+    float    durations[3]     = {44100.0f, 44100.0f, 44100.0f};
+    int      durIdx           = 0;
+    float    avgDuration      = 44100.0f;
+
+    // One-pole smoothing (~2.3s time constant at 44100 Hz)
+    static constexpr float SMOOTH = 1e-5f;
+
+    // Thresholds in samples
+    static constexpr float FAST_INTERVAL  = 2205.0f;   // 50ms
+    static constexpr float SLOW_INTERVAL  = 44100.0f;  // 1000ms
+    static constexpr float SHORT_DUR      = 2205.0f;   // 50ms
+    static constexpr float LONG_DUR       = 88200.0f;  // 2000ms
+
+    void noteOn() {
+        uint64_t now = sampleCounter;
+        uint64_t interval = now - lastNoteOnSample;
+        lastNoteOnSample = now;
+        // Smooth the interval (exponential moving average)
+        if (interval < (uint64_t)(SLOW_INTERVAL * 4))  // ignore huge gaps
+            avgIntervalSamples += 0.3f * ((float)interval - avgIntervalSamples);
+    }
+
+    void noteOff() {
+        uint64_t dur = sampleCounter - lastNoteOnSample;
+        durations[durIdx] = (float)dur;
+        durIdx = (durIdx + 1) % 3;
+        avgDuration = (durations[0] + durations[1] + durations[2]) / 3.0f;
+    }
+
+    void tick() {
+        sampleCounter++;
+
+        // Map interval → speed: fast (small interval) = 1, slow = 0
+        float rawSpeed = 1.0f - (avgIntervalSamples - FAST_INTERVAL) / (SLOW_INTERVAL - FAST_INTERVAL);
+        if (rawSpeed < 0.0f) rawSpeed = 0.0f;
+        if (rawSpeed > 1.0f) rawSpeed = 1.0f;
+        speed += SMOOTH * (rawSpeed - speed);
+
+        // Map duration → length: long = 1, short = 0
+        float rawLength = (avgDuration - SHORT_DUR) / (LONG_DUR - SHORT_DUR);
+        if (rawLength < 0.0f) rawLength = 0.0f;
+        if (rawLength > 1.0f) rawLength = 1.0f;
+        length += SMOOTH * (rawLength - length);
+    }
+};
+
+// ─── Distortion (tanh waveshaper) ───────────────────────────────────────────
+
+struct Distortion {
+    float drive  = 1.0f;
+    float dryWet = 0.0f;
+    float amount = 0.0f;
+
+    void updateFromDynamics(float speed, float releaseNorm) {
+        amount = speed * (0.3f + 0.7f * (1.0f - releaseNorm));
+        drive  = 1.0f + amount * 15.0f;
+        dryWet = amount;
+    }
+
+    float process(float in) {
+        float boosted = in * (1.0f + amount * 0.5f);
+        float wet = tanhf(boosted * drive) / tanhf(drive);
+        return in + dryWet * (wet - in);
+    }
+};
+
+// ─── LP-Comb filter (for Schroeder reverb) ──────────────────────────────────
+
+struct LPComb {
+    float  buf[4096];
+    int    size    = 0;
+    int    idx     = 0;
+    float  feedback = 0.0f;
+    float  lpState = 0.0f;
+    float  lpCoeff = 0.45f;
+
+    void init(int delaySamples, float fb) {
+        size = delaySamples;
+        if (size > 4096) size = 4096;
+        feedback = fb;
+        idx = 0;
+        lpState = 0.0f;
+        memset(buf, 0, sizeof(buf));
+    }
+
+    float process(float in) {
+        float out = buf[idx];
+        // One-pole LPF in feedback path (dark/warm character)
+        lpState = out + lpCoeff * (lpState - out);
+        buf[idx] = in + lpState * feedback;
+        idx++;
+        if (idx >= size) idx = 0;
+        return out;
+    }
+};
+
+// ─── Allpass filter (diffusion) ─────────────────────────────────────────────
+
+struct Allpass {
+    float  buf[2048];
+    int    size = 0;
+    int    idx  = 0;
+    float  gain = 0.5f;
+
+    void init(int delaySamples, float g) {
+        size = delaySamples;
+        if (size > 2048) size = 2048;
+        gain = g;
+        idx = 0;
+        memset(buf, 0, sizeof(buf));
+    }
+
+    float process(float in) {
+        float delayed = buf[idx];
+        float out = -in + delayed;
+        buf[idx] = in + delayed * gain;
+        idx++;
+        if (idx >= size) idx = 0;
+        return out;
+    }
+};
+
+// ─── Stereo Reverb (Schroeder, SP404-inspired) ─────────────────────────────
+
+struct Reverb {
+    // 4 LP-comb filters per channel (L/R have different prime delays for stereo)
+    LPComb combL[4];
+    LPComb combR[4];
+    // 2 allpass filters per channel
+    Allpass apL[2];
+    Allpass apR[2];
+
+    float wet = 0.0f;
+    float amount = 0.0f;
+
+    void init() {
+        // Comb delay times (near-prime sample counts, ~40-50ms for larger room)
+        // L channel
+        combL[0].init(1764, 0.88f);  // ~40.0ms
+        combL[1].init(1887, 0.86f);  // ~42.8ms
+        combL[2].init(2023, 0.90f);  // ~45.9ms
+        combL[3].init(2197, 0.92f);  // ~49.8ms
+        // R channel (slightly offset for stereo width)
+        combR[0].init(1789, 0.88f);
+        combR[1].init(1913, 0.86f);
+        combR[2].init(2053, 0.90f);
+        combR[3].init(2232, 0.92f);
+
+        // Allpass diffusers (~7ms and ~2.5ms for more diffusion)
+        apL[0].init(307, 0.5f);   // ~7.0ms
+        apL[1].init(113, 0.5f);   // ~2.6ms
+        apR[0].init(331, 0.5f);   // ~7.5ms (offset)
+        apR[1].init(127, 0.5f);   // ~2.9ms (offset)
+    }
+
+    void updateFromDynamics(float length, float releaseNorm) {
+        amount = length * (0.5f + 0.5f * releaseNorm);
+        wet = amount * 0.85f;
+    }
+
+    void process(float in, float& outL, float& outR) {
+        // Sum of 4 parallel combs per channel
+        float sumL = 0.0f, sumR = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            sumL += combL[i].process(in);
+            sumR += combR[i].process(in);
+        }
+        sumL *= 0.25f;
+        sumR *= 0.25f;
+
+        // Series allpass diffusion
+        for (int i = 0; i < 2; i++) {
+            sumL = apL[i].process(sumL);
+            sumR = apR[i].process(sumR);
+        }
+
+        // Dry/wet mix
+        outL = in + wet * (sumL - in);
+        outR = in + wet * (sumR - in);
+    }
 };
 
 // ─── MIDI note → frequency ──────────────────────────────────────────────────
@@ -496,9 +698,14 @@ int main() {
     osc_send_str(mother_sock, &mother_addr, "/oled/line/2", "Audio ready");
     osc_send_1i(mother_sock, &mother_addr, "/led", LED_COLORS[0]);
 
-    // ── Voice + params ──
+    // ── Voice + params + effects ──
     Voice voice;
     TriLFO pwmLfo;
+    NoteTracker tracker;
+    Distortion dist;
+    Reverb reverb;
+    reverb.init();
+    float releaseNorm  = 0.0f;
     float volTarget    = 0.5f;
     float volSmooth    = 0.5f;
     float cutoffTarget = 8000.0f;
@@ -513,6 +720,7 @@ int main() {
     float dispCutoffHz  = 8000.0f;
     float dispReso      = 0.0f;
     float dispReleaseMs = 200.0f;
+    float dispRatio     = 1.0f;
 
     // Previous OLED strings / VU for dirty checking
     char prevLine1[32] = "";
@@ -553,7 +761,9 @@ int main() {
                     int note = index + 59;
                     if (vel > 0) {
                         voice.noteOn(note);
+                        tracker.noteOn();
                     } else {
+                        tracker.noteOff();
                         voice.noteOff(note);
                     }
                 } else if (index == 0 && vel > 0) {  // AUX button
@@ -570,11 +780,18 @@ int main() {
                 int32_t k4 = osc_int(osc_buf + args_off + 12);
                 int32_t k5 = osc_int(osc_buf + args_off + 16);
 
-                // K1: Portamento 0–500ms linear (also sets PWM LFO rate)
-                float portoMs = k1 * (500.0f / 1023.0f);
-                voice.porta.setTime(portoMs);
-                pwmLfo.setPeriodMs(portoMs);
-                dispPortoMs = portoMs;
+                // K1: depends on waveform mode
+                if (voice.targetWaveform == 3) {
+                    // Ratio PWM mode: K1 controls PWM ratio 0.0625–8.0 continuous
+                    voice.osc.pwmRatio = 0.0625f * powf(128.0f, k1 / 1023.0f);
+                    dispRatio = voice.osc.pwmRatio;
+                } else {
+                    // Portamento 0–500ms linear (also sets PWM LFO rate)
+                    float portoMs = k1 * (500.0f / 1023.0f);
+                    voice.porta.setTime(portoMs);
+                    pwmLfo.setPeriodMs(portoMs);
+                    dispPortoMs = portoMs;
+                }
 
                 // K2: Filter cutoff 20–18kHz exponential (target only, smoothed in audio loop)
                 cutoffTarget = 20.0f * powf(900.0f, k2 / 1023.0f);
@@ -588,6 +805,7 @@ int main() {
                 float releaseMs = 10.0f * powf(200.0f, k4 / 1023.0f);
                 voice.env.setRelease(releaseMs);
                 dispReleaseMs = releaseMs;
+                releaseNorm = k4 / 1023.0f;
 
                 // K5: Master volume 0–1
                 volTarget = k5 / 1023.0f;
@@ -614,21 +832,39 @@ int main() {
             resoSmooth   += PARAM_SMOOTH_COEFF * (resoTarget - resoSmooth);
             volSmooth    += PARAM_SMOOTH_COEFF * (volTarget - volSmooth);
 
-            voice.osc.pulseWidth = 0.5f + 0.4f * pwmLfo.tick();
+            if (voice.targetWaveform != 3) {
+                voice.osc.pulseWidth = 0.5f + 0.4f * pwmLfo.tick();
+            } else {
+                pwmLfo.tick();  // keep phase advancing to avoid discontinuity on mode switch
+            }
             voice.filt.setParams(cutoffSmooth, resoSmooth);
 
-            float s = voice.tick() * volSmooth;
-            // Soft clip
-            if (s > 1.0f) s = 1.0f;
-            else if (s < -1.0f) s = -1.0f;
+            // Update dynamics
+            tracker.tick();
+            dist.updateFromDynamics(tracker.speed, releaseNorm);
+            reverb.updateFromDynamics(tracker.length, releaseNorm);
 
-            // Track peak level for VU
-            float absS = fabsf(s);
+            // Signal chain: osc → filter → envelope → distortion → reverb
+            float s = voice.tick();
+            s = dist.process(s);
+            float outL, outR;
+            reverb.process(s, outL, outR);
+            outL *= volSmooth;
+            outR *= volSmooth;
+
+            // Soft clip
+            if (outL > 1.0f) outL = 1.0f;
+            else if (outL < -1.0f) outL = -1.0f;
+            if (outR > 1.0f) outR = 1.0f;
+            else if (outR < -1.0f) outR = -1.0f;
+
+            // Track peak level for VU (use louder channel)
+            float absL = fabsf(outL), absR = fabsf(outR);
+            float absS = absL > absR ? absL : absR;
             if (absS > peakLevel) peakLevel = absS;
 
-            int16_t sample = (int16_t)(s * 32767.0f * MASTER_GAIN);
-            buf[i * 2]     = sample;  // L
-            buf[i * 2 + 1] = sample;  // R
+            buf[i * 2]     = (int16_t)(outL * 32767.0f * MASTER_GAIN);  // L
+            buf[i * 2 + 1] = (int16_t)(outR * 32767.0f * MASTER_GAIN);  // R
         }
 
         // Write to ALSA
@@ -651,8 +887,12 @@ int main() {
 
             char line[32];
 
-            // Line 1: Portamento
-            snprintf(line, sizeof(line), "Porto: %dms", (int)dispPortoMs);
+            // Line 1: Portamento or Ratio (depends on waveform mode)
+            if (voice.targetWaveform == 3) {
+                snprintf(line, sizeof(line), "Ratio: %.2fx", dispRatio);
+            } else {
+                snprintf(line, sizeof(line), "Porto: %dms", (int)dispPortoMs);
+            }
             if (strcmp(line, prevLine1) != 0) {
                 osc_send_str(mother_sock, &mother_addr, "/oled/line/1", line);
                 strcpy(prevLine1, line);
@@ -685,15 +925,10 @@ int main() {
                 strcpy(prevLine4, line);
             }
 
-            // Line 5: Waveform name (with morph indicator)
-            float morphFrac = voice.morphPos - floorf(voice.morphPos);
-            int morphLo = ((int)floorf(voice.morphPos) % NUM_WAVEFORMS + NUM_WAVEFORMS) % NUM_WAVEFORMS;
-            if (morphFrac > 0.001f) {
-                int morphHi = (morphLo + 1) % NUM_WAVEFORMS;
-                snprintf(line, sizeof(line), "%s > %s", WAVE_NAMES[morphLo], WAVE_NAMES[morphHi]);
-            } else {
-                snprintf(line, sizeof(line), "%s", WAVE_NAMES[morphLo]);
-            }
+            // Line 5: Distortion + Reverb amounts
+            int dstPct = (int)(dist.amount * 100.0f);
+            int rvbPct = (int)(reverb.amount * 100.0f);
+            snprintf(line, sizeof(line), "Dst:%d%% Rvb:%d%%", dstPct, rvbPct);
             if (strcmp(line, prevLine5) != 0) {
                 osc_send_str(mother_sock, &mother_addr, "/oled/line/5", line);
                 strcpy(prevLine5, line);
